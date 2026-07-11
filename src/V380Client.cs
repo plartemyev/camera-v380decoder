@@ -155,7 +155,7 @@ namespace V380Decoder.src
                     return 0;
                 }
                 uint loginResult = ReadUInt32LE(resp, 4);
-                if (loginResult != 1001)
+                if (loginResult != 1001 && loginResult != 1002)
                 {
                     if (loginResult == 1011)
                         Console.Error.WriteLine($"[AUTH] invalid username. exiting...");
