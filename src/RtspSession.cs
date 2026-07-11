@@ -173,25 +173,29 @@ namespace V380Decoder.src {
 		}
 
 		void SendHevcFragmented(byte[] nal, uint rts, int mtu) {
-			byte nalHdr = nal[0];
-			byte fuInd = (byte)((nalHdr & 0x81) | 49);
-			int offset = 1;
-			bool first = true;
-			while (offset < nal.Length) {
-				int chunk = Math.Min(mtu - 2, nal.Length - offset);
-				bool last = offset + chunk >= nal.Length;
-				byte fuHdr = (byte)((nalHdr >> 1) & 0x3F);
-				if (first) fuHdr |= 0x80;
-				if (last) fuHdr |= 0x40;
-				var frag = new byte[2 + chunk];
-				frag[0] = fuInd;
-				frag[1] = fuHdr;
-				Array.Copy(nal, offset, frag, 2, chunk);
-				SendRtp(videoCh, 97, videoSeq++, rts, videoSsrc, frag, 0, frag.Length, marker: last);
-				offset += chunk;
-				first = false;
-			}
-		}
+		            // RFC 7798: HEVC FU-A fragmentation
+		            // FU Indicator: 1 byte (F=0, Type=49) = 0x31
+		            // FU Header: 1 byte (S|E|FuType)
+		            byte nalHdr = nal[0];
+		            int fuType = (nalHdr >> 1) & 0x3F;
+		            byte fuInd = 0x31; // F=0, Type=49
+		            int offset = 1;
+		            bool first = true;
+		            while (offset < nal.Length) {
+		                int chunk = Math.Min(mtu - 2, nal.Length - offset);
+		                bool last = offset + chunk >= nal.Length;
+		                byte fuHdr = (byte)fuType;
+		                if (first) fuHdr |= 0x80; // S bit
+		                if (last) fuHdr |= 0x40;  // E bit
+		                var frag = new byte[2 + chunk];
+		                frag[0] = 0x31; // FU Indicator: F=0, Type=49
+		                frag[1] = fuHdr;
+		                Array.Copy(nal, offset, frag, 2, chunk);
+		                SendRtp(videoCh, 97, videoSeq++, rts, videoSsrc, frag, 0, frag.Length, marker: last);
+		                offset += chunk;
+		                first = false;
+		            }
+		        }
 
 		public void PushAudio(FrameData f) {
 			if (!playing) return;

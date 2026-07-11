@@ -26,7 +26,7 @@ namespace V380Decoder.src
             this.enableOnvif = enableOnvif;
         }
 
-        public void Start()
+        public async Task Start()
                 {
                     string ipAddress = NetworkHelper.GetLocalIPAddress();
                     var builder = WebApplication.CreateBuilder();
@@ -101,20 +101,20 @@ namespace V380Decoder.src
 
                         app.MapGet("/", () => Results.Content(WebPage.GetHtml(), "text/html"));
 
-                        app.MapPost("/api/ptz/right", () => { client.PtzRight(); LogUtils.debug("[API] PTZ Right"); Results.Ok(); });
-                        app.MapPost("/api/ptz/left", () => { client.PtzLeft(); LogUtils.debug("[API] PTZ Left"); Results.Ok(); });
-                        app.MapPost("/api/ptz/up", () => { client.PtzUp(); LogUtils.debug("[API] PTZ Up"); Results.Ok(); });
-                        app.MapPost("/api/ptz/down", () => { client.PtzDown(); LogUtils.debug("[API] PTZ Down"); Results.Ok(); });
-                        app.MapPost("/api/ptz/stop", () => { client.PtzStop(); LogUtils.debug("[API] PTZ Stop"); Results.Ok(); });
+                        app.MapPost("/api/ptz/right", () => { client.PtzRight(); LogUtils.debug("[API] PTZ Right"); return Results.Ok(); });
+                        app.MapPost("/api/ptz/left", () => { client.PtzLeft(); LogUtils.debug("[API] PTZ Left"); return Results.Ok(); });
+                        app.MapPost("/api/ptz/up", () => { client.PtzUp(); LogUtils.debug("[API] PTZ Up"); return Results.Ok(); });
+                        app.MapPost("/api/ptz/down", () => { client.PtzDown(); LogUtils.debug("[API] PTZ Down"); return Results.Ok(); });
+                        app.MapPost("/api/ptz/stop", () => { client.PtzStop(); LogUtils.debug("[API] PTZ Stop"); return Results.Ok(); });
 
-                        app.MapPost("/api/light/on", () => { client.LightOn(); LogUtils.debug("[API] Light On"); Results.Ok(); });
-                        app.MapPost("/api/light/off", () => { client.LightOff(); LogUtils.debug("[API] Light Off"); Results.Ok(); });
-                        app.MapPost("/api/light/auto", () => { client.LightAuto(); LogUtils.debug("[API] Light Auto"); Results.Ok(); });
+                        app.MapPost("/api/light/on", () => { client.LightOn(); LogUtils.debug("[API] Light On"); return Results.Ok(); });
+                        app.MapPost("/api/light/off", () => { client.LightOff(); LogUtils.debug("[API] Light Off"); return Results.Ok(); });
+                        app.MapPost("/api/light/auto", () => { client.LightAuto(); LogUtils.debug("[API] Light Auto"); return Results.Ok(); });
 
-                        app.MapPost("/api/image/color", () => { client.ImageColor(); LogUtils.debug("[API] Image Color"); Results.Ok(); });
-                        app.MapPost("/api/image/bw", () => { client.ImageBW(); LogUtils.debug("[API] Image B&W"); Results.Ok(); });
-                        app.MapPost("/api/image/auto", () => { client.ImageAuto(); LogUtils.debug("[API] Image Auto"); Results.Ok(); });
-                        app.MapPost("/api/image/flip", () => { client.ImageFlip(); LogUtils.debug("[API] Image Flip"); Results.Ok(); });
+                        app.MapPost("/api/image/color", () => { client.ImageColor(); LogUtils.debug("[API] Image Color"); return Results.Ok(); });
+                        app.MapPost("/api/image/bw", () => { client.ImageBW(); LogUtils.debug("[API] Image B&W"); return Results.Ok(); });
+                        app.MapPost("/api/image/auto", () => { client.ImageAuto(); LogUtils.debug("[API] Image Auto"); return Results.Ok(); });
+                        app.MapPost("/api/image/flip", () => { client.ImageFlip(); LogUtils.debug("[API] Image Flip"); return Results.Ok(); });
 
                         app.MapGet("/api/status", () => Results.Ok(new StatusResponse
                         {
@@ -142,7 +142,10 @@ namespace V380Decoder.src
 
                     LogUtils.debug($"[WEBSERVER] Starting on port {httpPort}...");
                     runTask = app.RunAsync();
-                    LogUtils.debug($"[WEBSERVER] Started successfully");
+                    LogUtils.debug($"[WEBSERVER] Started successfully - waiting for task to complete");
+                    // Give Kestrel a moment to bind
+                    await Task.Delay(100);
+                    LogUtils.debug($"[WEBSERVER] After delay, task status: {runTask.Status}");
                 }
 
         private async Task HandleOnvif(HttpContext ctx)

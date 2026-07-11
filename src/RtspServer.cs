@@ -117,39 +117,40 @@ namespace V380Decoder.src {
 		}
 
 		public string BuildSdp() {
-			string fmtpH264 = "";
-			string fmtpH265 = "";
-			string rtpmap = "a=rtpmap:96 H264/90000\r\n";
-			lock (sdpLock) {
-				if (cachedSps != null && cachedPps != null) {
-					string spsB64 = Convert.ToBase64String(cachedSps);
-					string ppsB64 = Convert.ToBase64String(cachedPps);
-					string pli = cachedSps.Length >= 3 ? $"{cachedSps[0]:X2}{cachedSps[1]:X2}{cachedSps[2]:X2}" : "64001F";
-					fmtpH264 = $"a=fmtp:96 packetization-mode=1;sprop-parameter-sets={spsB64},{ppsB64};profile-level-id={pli}\r\n";
-				}
-				if (cachedVps != null && cachedHevcSps != null && cachedHevcPps != null) {
-					string vpsB64 = Convert.ToBase64String(cachedVps);
-					string spsB64 = Convert.ToBase64String(cachedHevcSps);
-					string ppsB64 = Convert.ToBase64String(cachedHevcPps);
-					fmtpH265 = $"a=fmtp:97 profile-id=1;sprop-vps={vpsB64};sprop-sps={spsB64};sprop-pps={ppsB64}\r\n";
-					rtpmap = "a=rtpmap:96 H264/90000\r\na=rtpmap:97 H265/90000\r\n";
-				}
-			}
-			LogUtils.debug($"[RTSP] SDP h264={!string.IsNullOrEmpty(fmtpH264)} hevc={!string.IsNullOrEmpty(fmtpH265)}");
-			return "v=0\r\n" +
-				"o=- 1 1 IN IP4 0.0.0.0\r\n" +
-				"s=V380 Live\r\n" +
-				"t=0 0\r\n" +
-				"a=recvonly\r\n" +
-				"m=video 0 RTP/AVP 96 97\r\n" +
-				rtpmap +
-				fmtpH264 +
-				fmtpH265 +
-				"a=control:trackID=0\r\n" +
-				"m=audio 0 RTP/AVP 8\r\n" +
-				"a=rtpmap:8 PCMA/8000/1\r\n" +
-				"a=control:trackID=1\r\n";
-		}
+		            string fmtpH264 = "";
+		            string fmtpH265 = "";
+		            string rtpmap = "a=rtpmap:96 H264/90000\r\n";
+		            lock (sdpLock) {
+		                if (cachedSps != null && cachedPps != null) {
+		                    string spsB64 = Convert.ToBase64String(cachedSps);
+		                    string ppsB64 = Convert.ToBase64String(cachedPps);
+		                    string pli = cachedSps.Length >= 3 ? $"{cachedSps[0]:X2}{cachedSps[1]:X2}{cachedSps[2]:X2}" : "64001F";
+		                    fmtpH264 = $"a=fmtp:96 packetization-mode=1;sprop-parameter-sets={spsB64},{ppsB64};profile-level-id={pli}\r\n";
+		                }
+		                if (cachedVps != null && cachedHevcSps != null && cachedHevcPps != null) {
+		                    string vpsB64 = Convert.ToBase64String(cachedVps);
+		                    string spsB64 = Convert.ToBase64String(cachedHevcSps);
+		                    string ppsB64 = Convert.ToBase64String(cachedHevcPps);
+		                    fmtpH265 = $"a=fmtp:97 profile-id=1;sprop-vps={vpsB64};sprop-sps={spsB64};sprop-pps={ppsB64}\r\n";
+		                    rtpmap = "a=rtpmap:96 H264/90000\r\na=rtpmap:97 H265/90000\r\n";
+		                }
+		            }
+		            LogUtils.debug($"[RTSP] SDP h264={!string.IsNullOrEmpty(fmtpH264)} hevc={!string.IsNullOrEmpty(fmtpH265)}");
+		            string videoLine = !string.IsNullOrEmpty(fmtpH265) ? "m=video 0 RTP/AVP 96 97\r\n" : "m=video 0 RTP/AVP 96\r\n";
+		            return "v=0\r\n" +
+		                "o=- 1 1 IN IP4 0.0.0.0\r\n" +
+		                "s=V380 Live\r\n" +
+		                "t=0 0\r\n" +
+		                "a=recvonly\r\n" +
+		                videoLine +
+		                rtpmap +
+		                fmtpH264 +
+		                fmtpH265 +
+		                "a=control:trackID=0\r\n" +
+		                "m=audio 0 RTP/AVP 8\r\n" +
+		                "a=rtpmap:8 PCMA/8000/1\r\n" +
+		                "a=control:trackID=1\r\n";
+		        }
 
 		public byte[] GetHevcParameterSets() {
 			lock (sdpLock) {

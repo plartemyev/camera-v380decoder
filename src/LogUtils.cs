@@ -7,7 +7,7 @@ namespace V380Decoder.src
 {
     public class LogUtils
     {
-        public static bool enableDebug = true;
+        public static bool enableDebug = false;
 
         public static void debug(string log)
         {
