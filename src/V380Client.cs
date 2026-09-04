@@ -8,6 +8,8 @@ namespace V380Decoder.src
     public class V380Client : IDisposable
     {
         public SnapshotManager snapshotManager { get; private set; }
+        public int Channel { get; set; } = 0;
+        public ushort lastStreamToken { get; private set; } = 0x3001;
         private TcpClient authClient, streamClient;
         private NetworkStream authStream, streamStream;
         private readonly string ip;
@@ -250,10 +252,11 @@ namespace V380Decoder.src
                 WriteUInt32LE(cmd301, 58, (uint)port); //port
                 WriteUInt32LE(cmd301, 62, deviceId); //device id
                 WriteUInt32LE(cmd301, 66, authTicket); // auth ticket
-                WriteUInt32LE(cmd301, 70, sessionId); // session id
+                uint activeSession = sessionId != 0 ? sessionId : authTicket;
+                WriteUInt32LE(cmd301, 70, activeSession); // session id (fallback to authTicket if 0)
                 WriteUInt32LE(cmd301, 74, (uint)streamQuality); //quality 0=SD, 1=HD
-                cmd301[78] = 20; //unknown2 
-                WriteUInt32LE(cmd301, 79, 1); //unknown23
+                cmd301[78] = (byte)Channel; // Channel / lens index (0, 1, 2)
+                WriteUInt16LE(cmd301, 79, 0x1001); // 4097 = stream flags with audio
             }
 
             if (!SendData(streamStream, cmd301))
@@ -276,11 +279,35 @@ namespace V380Decoder.src
                 return false;
             }
 
-            int result = (int)ReadUInt32LE(resp401, 4);
-            if (result == -11 || result == -12)
+            int relayStatus = (int)ReadUInt32LE(resp401, 4);
+            int deviceStatus = resp401.Length >= 12 ? (int)ReadUInt32LE(resp401, 8) : 0;
+            int reasonCode = resp401.Length >= 16 ? (int)ReadUInt32LE(resp401, 12) : 0;
+
+            LogUtils.debug($"[STREAM] login raw hex: {BitConverter.ToString(resp401, 0, Math.Min(resp401.Length, 32))}");
+            LogUtils.debug($"[STREAM] login relayStatus={relayStatus} (0x{relayStatus:X8}), deviceStatus={deviceStatus} (0x{deviceStatus:X8}), reasonCode={reasonCode}");
+
+            if (source == SourceStream.Cloud)
             {
-                Console.Error.WriteLine($"[STREAM] login failed result={result}");
-                return false;
+                if (deviceStatus == -11 || deviceStatus == -12)
+                {
+                    Console.Error.WriteLine($"[STREAM] login rejected by camera: deviceStatus={deviceStatus} reason={reasonCode}");
+                    return false;
+                }
+                if (relayStatus == -11 || relayStatus == -12)
+                {
+                    Console.Error.WriteLine($"[STREAM] login failed relayStatus={relayStatus}");
+                    return false;
+                }
+                lastStreamToken = (ushort)(deviceStatus > 0 ? (ushort)deviceStatus : 0x3001);
+            }
+            else
+            {
+                if (relayStatus == -11 || relayStatus == -12)
+                {
+                    Console.Error.WriteLine($"[STREAM] login failed result={relayStatus}");
+                    return false;
+                }
+                lastStreamToken = (ushort)(relayStatus > 0 ? (ushort)relayStatus : 0x3001);
             }
 
             LogUtils.debug($"[STREAM] login response success");
@@ -297,7 +324,7 @@ namespace V380Decoder.src
                 communicationVersion = version;
                 frameWidth = (int)width;
                 frameheight = (int)height;
-                LogUtils.debug($"[STREAM] login result: {result}");
+                LogUtils.debug($"[STREAM] login result: {relayStatus}");
                 LogUtils.debug($"[STREAM] login version: {version}");
                 LogUtils.debug($"[STREAM] login width: {width}");
                 LogUtils.debug($"[STREAM] login height: {height}");
@@ -308,16 +335,16 @@ namespace V380Decoder.src
             }
 
             if (deviceVersion > 30) GenerateMediaKey(authTicket);
-            Console.Error.WriteLine($"[STREAM] login OK quality={(streamQuality == 0 ? "SD" : "HD")}");
+            Console.Error.WriteLine($"[STREAM] login OK quality={(streamQuality == 0 ? "SD" : "HD")} channel={Channel}");
             return true;
         }
 
         public bool StartStream()
         {
-            Console.Error.WriteLine($"[STREAM] starting stream...");
+            Console.Error.WriteLine($"[STREAM] starting stream with token 0x{lastStreamToken:X4}...");
             var cmd303 = new byte[256];
             WriteUInt32LE(cmd303, 0, 303);
-            WriteUInt16LE(cmd303, 4, 0x3001);
+            WriteUInt16LE(cmd303, 4, lastStreamToken);
             return SendData(streamStream, cmd303);
         }
 

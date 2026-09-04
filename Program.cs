@@ -1,4 +1,4 @@
-﻿using V380Decoder.src;
+using V380Decoder.src;
 
 if (args.Length > 0)
 {
@@ -20,6 +20,7 @@ if (args.Length > 0)
     }
 
     int id = ArgParser.GetArg(args, "--id", 0);
+    int channel = ArgParser.GetArg(args, "--channel", 0);
     int port = ArgParser.GetArg(args, "--port", 8800);
     string username = ArgParser.GetArg(args, "--username", "admin");
     string password = ArgParser.GetArg(args, "--password", "");
@@ -91,6 +92,7 @@ if (args.Length > 0)
         outputMode,
         streamQuality
     );
+    client.Channel = channel;
 
     RtspServer rtsp = null;
     WebServer webServer = null;
@@ -184,6 +186,11 @@ CONNECTION OPTIONS:
   --source <mode>        Source type: 'lan' or 'cloud' (default: lan)
                          lan   - Direct connection to camera IP
                          cloud - Connection via relay server
+
+  --channel <number>     Lens/Channel index for multi-lens cameras (0, 1, 2) (default: 0)
+                         0 - Primary / Wide lens
+                         1 - Secondary / PTZ lens 1
+                         2 - Tertiary / PTZ lens 2
 
 OUTPUT OPTIONS:
   --output <type>        Output type: 'video', 'audio', or 'rtsp' (default: rtsp)
