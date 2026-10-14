@@ -13,6 +13,13 @@ namespace V380Decoder.src
         public int lastRelayStatus { get; private set; } = -1;
         private TcpClient authClient, streamClient;
         private NetworkStream authStream, streamStream;
+        // modern (v31+) cloud session: control connection (cmd361) + live video connection (cmd363)
+        private TcpClient? controlClient, liveClient;
+        private NetworkStream? controlStream, liveStream;
+        private uint recordSize = 2040;   // resp463[0x4c]
+        private uint serverEpoch;         // resp463[8]
+        private volatile bool controlPingPending;
+        private CancellationTokenSource? controlKaCts;
         private readonly string ip;
         private readonly int port;
         private readonly uint deviceId;
@@ -64,6 +71,12 @@ namespace V380Decoder.src
                     int auth = GetAuthTicket();
                     if (auth == 0) continue;
                     if (auth == -1) break;
+
+                    if (source == SourceStream.Cloud && deviceVersion > 30)
+                    {
+                        RunModernCloudSession(rtsp, ct);
+                        continue;
+                    }
 
                     if (!StreamLogin())
                     {
@@ -217,6 +230,356 @@ namespace V380Decoder.src
         }
 
 
+        // ---------------------------------------------------------------------
+        // Modern cloud session (v31 firmware, observed on Android app 2026-10-14)
+        //
+        //   conn A (control): cmd361 [4]=1012 -> resp2000; server pings cmd2000,
+        //                     client answers cmd362 (16B)
+        //   conn B (live):    cmd363 [4]=1002, [74]=date, [78]=time -> resp463
+        //                     (64B: [4]=1000, [8]=epoch, [0x14w]=31, [0x4c]=recordSize)
+        //                     -> cmd364 sub1 -> server cmd111 (8B) -> cmd364 sub2
+        //                     -> records: 7f [type] [seq] [flag] [len:LE32] payload
+        //                     -> cmd364 every ~2.5s; close = cmd1008
+        // ---------------------------------------------------------------------
+
+        void BuildCloudLogin(byte[] cmd, uint cmdId, uint subcode, bool withDateTime)
+        {
+            WriteUInt32LE(cmd, 0, cmdId);
+            WriteUInt32LE(cmd, 4, subcode);
+            var hostnameBytes = Encoding.ASCII.GetBytes($"{deviceId}.nvdvr.net");
+            Array.Copy(hostnameBytes, 0, cmd, 8, Math.Min(hostnameBytes.Length, 50));
+            WriteUInt32LE(cmd, 58, (uint)port);
+            WriteUInt32LE(cmd, 62, deviceId);
+            WriteUInt32LE(cmd, 66, authTicket);
+            WriteUInt32LE(cmd, 70, sessionId != 0 ? sessionId : authTicket);
+            if (withDateTime)
+            {
+                var now = DateTime.Now;
+                WriteUInt16LE(cmd, 74, (ushort)now.Year);
+                cmd[76] = (byte)now.Month;
+                cmd[77] = (byte)now.Day;
+                cmd[78] = (byte)now.Hour;
+                cmd[79] = (byte)now.Minute;
+                cmd[80] = (byte)now.Second;
+            }
+        }
+
+        void RunModernCloudSession(RtspServer rtsp, CancellationToken ct)
+        {
+            Console.Error.WriteLine("[MODERN] starting v31 cloud session (control 361 + live 363)");
+            try
+            {
+                if (!SessionConnect())
+                {
+                    Console.Error.WriteLine("[MODERN] control connection failed");
+                    Thread.Sleep(3000);
+                    return;
+                }
+                if (!LiveLogin())
+                {
+                    Console.Error.WriteLine("[MODERN] live login failed");
+                    CloseModern();
+                    Thread.Sleep(3000);
+                    return;
+                }
+                ReceiveLiveFrames(rtsp, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[MODERN] error: {ex.Message}");
+            }
+            finally
+            {
+                CloseModern();
+            }
+        }
+
+        bool SessionConnect()
+        {
+            controlClient = new TcpClient { NoDelay = true, ReceiveBufferSize = 0x8000 };
+            var r = controlClient.BeginConnect(ip, port, null, null);
+            if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+            {
+                Console.Error.WriteLine("[CTRL] connect timeout");
+                controlClient.Close(); controlClient = null;
+                return false;
+            }
+            controlClient.EndConnect(r);
+            controlStream = controlClient.GetStream();
+
+            var cmd361 = new byte[256];
+            BuildCloudLogin(cmd361, 361, 1012, withDateTime: false);
+            if (!SendData(controlStream, cmd361)) return false;
+
+            var resp = ReceiveExact(controlStream, 256, 10);
+            if (resp == null || ReadUInt32LE(resp, 0) != 2000)
+            {
+                Console.Error.WriteLine($"[CTRL] unexpected response: {(resp == null ? "null" : ReadUInt32LE(resp, 0).ToString())} (expected 2000)");
+                return false;
+            }
+            Console.Error.WriteLine("[CTRL] session established (resp2000)");
+
+            // background thread: answer every server cmd2000 ping with cmd362
+            controlKaCts = new CancellationTokenSource();
+            var kaCt = controlKaCts.Token;
+            var kaStream = controlStream;
+            var kaThread = new Thread(() =>
+            {
+                var pingBuf = new byte[16];
+                while (!kaCt.IsCancellationRequested)
+                {
+                    try
+                    {
+                        if (!kaStream.DataAvailable) { Thread.Sleep(100); continue; }
+                        int n = kaStream.Read(pingBuf, 0, 16);
+                        if (n <= 0) break;
+                        uint c = ReadUInt32LE(pingBuf, 0);
+                        if (c == 2000)
+                        {
+                            var cmd362 = new byte[16];
+                            WriteUInt32LE(cmd362, 0, 362);
+                            kaStream.Write(cmd362, 0, 16);
+                        }
+                        else
+                        {
+                            Console.Error.WriteLine($"[CTRL] unexpected server cmd {c}");
+                        }
+                    }
+                    catch { break; }
+                }
+            });
+            kaThread.IsBackground = true;
+            kaThread.Start();
+            return true;
+        }
+
+        bool LiveLogin()
+        {
+            liveClient = new TcpClient { NoDelay = true, ReceiveBufferSize = 0x8000 };
+            var r = liveClient.BeginConnect(ip, port, null, null);
+            if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+            {
+                Console.Error.WriteLine("[LIVE] connect timeout");
+                liveClient.Close(); liveClient = null;
+                return false;
+            }
+            liveClient.EndConnect(r);
+            liveStream = liveClient.GetStream();
+
+            var cmd363 = new byte[256];
+            BuildCloudLogin(cmd363, 363, 1002, withDateTime: true);
+            if (!SendData(liveStream, cmd363)) return false;
+
+            var resp463 = ReceiveExact(liveStream, 64, 10);
+            if (resp463 == null || ReadUInt32LE(resp463, 0) != 463)
+            {
+                Console.Error.WriteLine($"[LIVE] unexpected response: {(resp463 == null ? "null" : (resp463.Length >= 4 ? ReadUInt32LE(resp463, 0).ToString() : "short"))} (expected 463)");
+                return false;
+            }
+            uint result = ReadUInt32LE(resp463, 4);
+            serverEpoch = ReadUInt32LE(resp463, 8);
+            recordSize = resp463.Length >= 0x50 ? ReadUInt32LE(resp463, 0x4c) : 2040;
+            if (recordSize == 0 || recordSize > 65536) recordSize = 2040;
+            Console.Error.WriteLine($"[LIVE] resp463 result={result} epoch={serverEpoch} recordSize={recordSize} ver={ReadUInt16LE(resp463, 0x14)}");
+
+            // handshake: cmd364 sub1 -> (server cmd111) -> cmd364 sub2
+            SendCmd364(1);
+            var srv = ReceiveExact(liveStream, 8, 5);
+            if (srv != null)
+                Console.Error.WriteLine($"[LIVE] server ack: cmd={ReadUInt32LE(srv, 0)} [{BitConverter.ToString(srv)}]");
+            SendCmd364(2);
+            Console.Error.WriteLine("[LIVE] login complete, expecting records");
+            return true;
+        }
+
+        void SendCmd364(uint sub)
+        {
+            var cmd364 = new byte[32];
+            WriteUInt32LE(cmd364, 0, 364);
+            WriteUInt16LE(cmd364, 4, (ushort)sub);
+            WriteUInt16LE(cmd364, 6, 200);
+            WriteUInt32LE(cmd364, 12, serverEpoch);
+            if (liveStream != null) SendData(liveStream, cmd364);
+        }
+
+        void ReceiveLiveFrames(RtspServer rtsp, CancellationToken ct)
+        {
+            var s = liveStream!;
+            var dumpPath = Environment.GetEnvironmentVariable("V380_LIVE_DUMP");
+            FileStream? dump = null;
+            if (!string.IsNullOrEmpty(dumpPath))
+            {
+                dump = new FileStream(dumpPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                Console.Error.WriteLine($"[LIVE] dumping records to {dumpPath}");
+            }
+
+            // frame assembly state per sub-stream (flag byte)
+            var chains = new Dictionary<uint, List<byte>>();
+            var lastSeq = new Dictionary<uint, ushort>();
+            long recCount = 0, videoDispatched = 0;
+            var kaDeadline = DateTime.Now.AddSeconds(2.5);
+
+            Console.Error.WriteLine("[RECV-LIVE] record loop started");
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    // periodic cmd364 keepalive (~2.5s), like the app
+                    if (DateTime.Now > kaDeadline)
+                    {
+                        SendCmd364(2);
+                        kaDeadline = DateTime.Now.AddSeconds(2.5);
+                    }
+
+                    int hdr = SyncAndReadHeader(s, out uint type, out ushort seq, out uint flag, out uint len);
+                    if (hdr == 0) { needReconnect = true; break; }
+                    if (len == 0 || len > 100000)
+                    {
+                        Console.Error.WriteLine($"[RECV-LIVE] bogus len={len}, resyncing");
+                        continue;
+                    }
+
+                    var payload = new byte[len];
+                    if (ReadExact(s, payload, 0, (int)len) < (int)len)
+                    {
+                        Console.Error.WriteLine("[RECV-LIVE] payload read failed");
+                        needReconnect = true;
+                        break;
+                    }
+                    recCount++;
+                    dump?.Write(payload, 0, payload.Length);
+                    if (recCount <= 12 || recCount % 200 == 0)
+                        Console.Error.WriteLine($"[RECV-LIVE] rec#{recCount} type={type} seq={seq} flag={flag} len={len} head={BitConverter.ToString(payload, 0, Math.Min(16, payload.Length))}");
+
+                    if (type == 0x16 || type == 0x1A)
+                    {
+                        // audio record - dump only for now
+                        continue;
+                    }
+                    if (type > 1)
+                    {
+                        Console.Error.WriteLine($"[RECV-LIVE] unhandled record type={type}");
+                        continue;
+                    }
+
+                    // video: chain records per sub-stream; a new frame starts when
+                    // seq restarts (<= last seq) or the record is short (len < recordSize)
+                    uint key = flag;
+                    bool startNew = !chains.TryGetValue(key, out var chain) || chain.Count == 0
+                                    || (lastSeq.TryGetValue(key, out var ls) && seq <= ls)
+                                    || len < recordSize;
+                    if (startNew && chain != null && chain.Count > 0)
+                    {
+                        DispatchLiveVideo(chain, type, mode, rtsp);
+                        videoDispatched++;
+                        chain = new List<byte>();
+                    }
+                    if (chain == null) { chain = new List<byte>(); chains[key] = chain; }
+                    chain.AddRange(payload);
+                    lastSeq[key] = seq;
+                }
+            }
+            finally
+            {
+                dump?.Dispose();
+                Console.Error.WriteLine($"[RECV-LIVE] loop ended: recs={recCount} videoFrames={videoDispatched}");
+            }
+        }
+
+        void DispatchLiveVideo(List<byte> chain, uint type, OutputMode mode, RtspServer rtsp)
+        {
+            var full = chain.ToArray();
+            LogUtils.debug($"[LIVE-FRAME] type={type} len={full.Length} head={BitConverter.ToString(full, 0, Math.Min(24, full.Length))}");
+            if (!HandleAsMediaFrame((byte)type, full, needDecrypt: deviceVersion > 30, mode, rtsp, null))
+            {
+                Console.Error.WriteLine($"[LIVE-FRAME] unroutable type={type} len={full.Length} head={BitConverter.ToString(full, 0, Math.Min(16, full.Length))}");
+            }
+        }
+
+        /// Reads a V380 record header (7f type seq flag len32), byte-syncing on 0x7f.
+        /// Returns total header bytes consumed (always 8), 0 on stream end/timeout.
+        int SyncAndReadHeader(NetworkStream s, out uint type, out ushort seq, out uint flag, out uint len)
+        {
+            type = 0; seq = 0; flag = 0; len = 0;
+            var buf = new byte[8];
+            // byte-wise sync on 0x7f (records start 7f XX XX XX len32)
+            if (!ReadByteOrTimeout(s, out byte b0)) return 0;
+            while (b0 != 0x7f)
+            {
+                Console.Error.WriteLine($"[RECV-LIVE] sync skip byte {b0:X2}");
+                if (!ReadByteOrTimeout(s, out b0)) return 0;
+            }
+            buf[0] = b0;
+            for (int i = 1; i < 8; i++)
+            {
+                if (!ReadByteOrTimeout(s, out buf[i])) return 0;
+            }
+            type = buf[1];
+            seq = buf[2];
+            flag = buf[3];
+            len = ReadUInt32LE(buf, 4);
+            return 8;
+        }
+
+        bool ReadByteOrTimeout(NetworkStream s, out byte b)
+        {
+            b = 0;
+            var deadline = DateTime.Now.AddSeconds(15);
+            while (DateTime.Now < deadline)
+            {
+                if (s.DataAvailable)
+                {
+                    int n = s.Read(m_singleByte, 0, 1);
+                    if (n == 1) { b = m_singleByte[0]; return true; }
+                    return false;
+                }
+                Thread.Sleep(5);
+            }
+            needReconnect = true;
+            return false;
+        }
+        private readonly byte[] m_singleByte = new byte[1];
+
+        byte[]? ReceiveExact(NetworkStream s, int cnt, int timeoutSec)
+        {
+            var buf = new byte[cnt];
+            int tot = 0;
+            var deadline = DateTime.Now.AddSeconds(timeoutSec);
+            while (tot < cnt && DateTime.Now < deadline)
+            {
+                if (!s.DataAvailable) { Thread.Sleep(10); continue; }
+                int n = s.Read(buf, tot, cnt - tot);
+                if (n <= 0) break;
+                tot += n;
+            }
+            if (tot == 0) return null;
+            if (tot < cnt)
+            {
+                var r = new byte[tot]; Array.Copy(buf, r, tot); return r;
+            }
+            return buf;
+        }
+
+        void CloseModern()
+        {
+            try
+            {
+                if (liveStream != null)
+                {
+                    var bye = new byte[16];
+                    WriteUInt32LE(bye, 0, 1008);
+                    liveStream.Write(bye, 0, 16);
+                }
+            }
+            catch { }
+            try { controlKaCts?.Cancel(); } catch { }
+            try { liveStream?.Close(); liveClient?.Close(); } catch { }
+            try { controlStream?.Close(); controlClient?.Close(); } catch { }
+            liveStream = null; liveClient = null; controlStream = null; controlClient = null;
+        }
+
+
         public bool StreamLogin()
         {
             streamClient = new TcpClient
@@ -247,7 +610,9 @@ namespace V380Decoder.src
             }
             else
             {
-                WriteUInt32LE(cmd301, 4, 1022); //unknown1 
+                // GetImageMR layout, matching the Android app byte-for-byte
+                // (capture 2026-10-14: [4]=1002, [74]=1, [78]=20, [80]=0x10, [82]=1, [87..89]=1)
+                WriteUInt32LE(cmd301, 4, 1002); // subcode
                 var hostnameBytes = Encoding.ASCII.GetBytes($"{deviceId}.nvdvr.net");
                 Array.Copy(hostnameBytes, 0, cmd301, 8, Math.Min(hostnameBytes.Length, 50)); //hostname
                 WriteUInt32LE(cmd301, 58, (uint)port); //port
@@ -255,14 +620,11 @@ namespace V380Decoder.src
                 WriteUInt32LE(cmd301, 66, authTicket); // auth ticket
                 uint activeSession = sessionId != 0 ? sessionId : authTicket;
                 WriteUInt32LE(cmd301, 70, activeSession); // session id (fallback to authTicket if 0)
-                // GetImageNew layout (HS_DevicePreview.dll @0x1000b430, v31 worker)
-                WriteUInt32LE(cmd301, 8, 0);
-                WriteUInt32LE(cmd301, 12, 20);
-                WriteUInt32LE(cmd301, 14, 0);
-                WriteUInt32LE(cmd301, 18, 0);
-                WriteUInt32LE(cmd301, 22, 0);
-                WriteUInt32LE(cmd301, 26, 0);
-                cmd301[30] = 1; cmd301[31] = 1; cmd301[32] = 1;
+                WriteUInt32LE(cmd301, 74, 1); // flag: audio requested
+                cmd301[78] = 20; // fps / version byte
+                cmd301[80] = 0x10;
+                cmd301[82] = 1;
+                cmd301[87] = 1; cmd301[88] = 1; cmd301[89] = 1;
             }
 
             if (!SendData(streamStream, cmd301))
@@ -271,7 +633,10 @@ namespace V380Decoder.src
                 return false;
             }
 
-            var resp401 = ReceiveData(streamStream, 412);
+            // App reads resp401 as exactly 32 bytes (16 header + 16 zero pad),
+            // then a 12-byte "go" message before frames start. The old 412-byte
+            // read swallowed the stream start into the header buffer.
+            var resp401 = ReceiveExact(streamStream, 32, 10);
 
             if (resp401 == null || resp401.Length < 8)
             {
@@ -288,6 +653,10 @@ namespace V380Decoder.src
             int relayStatus = (int)ReadUInt32LE(resp401, 4);
             int deviceStatus = resp401.Length >= 12 ? (int)ReadUInt32LE(resp401, 8) : 0;
             int reasonCode = resp401.Length >= 16 ? (int)ReadUInt32LE(resp401, 12) : 0;
+
+            // 12-byte stream-start message: 1f 00 05 d0 02 14 00 10 01 00 00 00
+            var go = ReceiveExact(streamStream, 12, 10);
+            Console.Error.WriteLine($"[STREAM] go message: {(go == null ? "none" : BitConverter.ToString(go))}");
 
             LogUtils.debug($"[STREAM] login raw hex: {BitConverter.ToString(resp401, 0, Math.Min(resp401.Length, 32))}");
             LogUtils.debug($"[STREAM] login relayStatus={relayStatus} (0x{relayStatus:X8}), deviceStatus={deviceStatus} (0x{deviceStatus:X8}), reasonCode={reasonCode}");
@@ -346,12 +715,13 @@ namespace V380Decoder.src
         public bool StartStream()
         {
             Console.Error.WriteLine($"[STREAM] starting stream (token=0x{lastStreamToken:X4}, echoRelayStatus={lastRelayStatus})...");
-            var cmd303 = new byte[256];
+            var cmd303 = new byte[16];
             WriteUInt32LE(cmd303, 0, 303);
             if (source == SourceStream.Cloud)
             {
-                // GetImageNew echoes resp401[4] into cmd303[4]
-                WriteUInt32LE(cmd303, 4, (uint)Math.Max(lastRelayStatus, 0));
+                // App sends a 16-byte cmd303 with token 0x3001 (capture 2026-10-14),
+                // not an echo of resp401[4]
+                WriteUInt32LE(cmd303, 4, 0x3001);
             }
             else
             {
