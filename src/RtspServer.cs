@@ -24,6 +24,7 @@ namespace V380Decoder.src {
 
 		public void Start() {
 			listener = new TcpListener(IPAddress.Any, port);
+			listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
 			listener.Start(10);
 			running = true;
 			acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "rtsp-accept" };

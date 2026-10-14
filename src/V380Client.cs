@@ -10,6 +10,7 @@ namespace V380Decoder.src
         public SnapshotManager snapshotManager { get; private set; }
         public int Channel { get; set; } = 0;
         public ushort lastStreamToken { get; private set; } = 0x3001;
+        public int lastRelayStatus { get; private set; } = -1;
         private TcpClient authClient, streamClient;
         private NetworkStream authStream, streamStream;
         private readonly string ip;
@@ -254,9 +255,14 @@ namespace V380Decoder.src
                 WriteUInt32LE(cmd301, 66, authTicket); // auth ticket
                 uint activeSession = sessionId != 0 ? sessionId : authTicket;
                 WriteUInt32LE(cmd301, 70, activeSession); // session id (fallback to authTicket if 0)
-                WriteUInt32LE(cmd301, 74, (uint)streamQuality); //quality 0=SD, 1=HD
-                cmd301[78] = (byte)Channel; // Channel / lens index (0, 1, 2)
-                WriteUInt16LE(cmd301, 79, 0x1001); // 4097 = stream flags with audio
+                // GetImageNew layout (HS_DevicePreview.dll @0x1000b430, v31 worker)
+                WriteUInt32LE(cmd301, 8, 0);
+                WriteUInt32LE(cmd301, 12, 20);
+                WriteUInt32LE(cmd301, 14, 0);
+                WriteUInt32LE(cmd301, 18, 0);
+                WriteUInt32LE(cmd301, 22, 0);
+                WriteUInt32LE(cmd301, 26, 0);
+                cmd301[30] = 1; cmd301[31] = 1; cmd301[32] = 1;
             }
 
             if (!SendData(streamStream, cmd301))
@@ -288,17 +294,15 @@ namespace V380Decoder.src
 
             if (source == SourceStream.Cloud)
             {
-                if (deviceStatus == -11 || deviceStatus == -12)
-                {
-                    Console.Error.WriteLine($"[STREAM] login rejected by camera: deviceStatus={deviceStatus} reason={reasonCode}");
-                    return false;
-                }
+                // GetImageNew: resp401[8]=-12 ("unsupported as asked") is NOT fatal -
+                // the Windows app proceeds (only resp401[4]==-11/-12 relay errors abort)
                 if (relayStatus == -11 || relayStatus == -12)
                 {
                     Console.Error.WriteLine($"[STREAM] login failed relayStatus={relayStatus}");
                     return false;
                 }
                 lastStreamToken = (ushort)(deviceStatus > 0 ? (ushort)deviceStatus : 0x3001);
+                lastRelayStatus = relayStatus;
             }
             else
             {
@@ -341,10 +345,18 @@ namespace V380Decoder.src
 
         public bool StartStream()
         {
-            Console.Error.WriteLine($"[STREAM] starting stream with token 0x{lastStreamToken:X4}...");
+            Console.Error.WriteLine($"[STREAM] starting stream (token=0x{lastStreamToken:X4}, echoRelayStatus={lastRelayStatus})...");
             var cmd303 = new byte[256];
             WriteUInt32LE(cmd303, 0, 303);
-            WriteUInt16LE(cmd303, 4, lastStreamToken);
+            if (source == SourceStream.Cloud)
+            {
+                // GetImageNew echoes resp401[4] into cmd303[4]
+                WriteUInt32LE(cmd303, 4, (uint)Math.Max(lastRelayStatus, 0));
+            }
+            else
+            {
+                WriteUInt16LE(cmd303, 4, lastStreamToken);
+            }
             return SendData(streamStream, cmd303);
         }
 
@@ -381,7 +393,28 @@ namespace V380Decoder.src
                         needReconnect = false;
                     }
 
-                    // 12-byte fragment header
+                    // 12-byte fragment header (LAN dialect). Cloud+v31: raw-dump first
+                    if (deviceVersion > 30 && source == SourceStream.Cloud)
+                    {
+                        // phased empirical probe: 30s passive, then 16B zero keepalives
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        var buf = new byte[4096];
+                        var zeros = new byte[16];
+                        while (!ct.IsCancellationRequested && sw.ElapsedMilliseconds < 60000)
+                        {
+                            int n = 0;
+                            try { streamStream.ReadTimeout = 400; n = streamStream.Read(buf, 0, buf.Length); }
+                            catch { n = 0; }
+                            if (n > 0)
+                                Console.Error.WriteLine($"[RAW t={sw.ElapsedMilliseconds}ms] n={n}: {Convert.ToHexString(buf, 0, Math.Min(n, 48))}");
+                            if (sw.ElapsedMilliseconds > 30000)
+                            {
+                                try { streamStream.Write(zeros, 0, 16); Console.Error.WriteLine($"[KA t={sw.ElapsedMilliseconds}ms] sent 16 zero bytes"); } catch { }
+                            }
+                        }
+                        needReconnect = true;
+                        continue;
+                    }
                     if (ReadExact(streamStream, header12, 0, 12) < 12) continue;
 
                     if (header12[0] != 0x7F)
@@ -975,7 +1008,7 @@ namespace V380Decoder.src
         int ReadExact(NetworkStream s, byte[] buf, int off, int cnt)
         {
             int tot = 0;
-            var deadline = DateTime.Now.AddSeconds(3);
+            var deadline = DateTime.Now.AddSeconds(15);
             while (tot < cnt)
             {
                 if (DateTime.Now > deadline)
