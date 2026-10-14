@@ -15,6 +15,15 @@ namespace V380Decoder.src
         };
         public static async Task<string> GetServerIPAsync(int deviceId)
         {
+            var ips = await GetServerIPsAsync(deviceId);
+            return ips.FirstOrDefault(string.Empty);
+        }
+
+        /// All dispatch relays (ordered), reachable on :8800. The camera is attached
+        /// only to some of them - a relay without the camera returns "offline" codes
+        /// (resp463 result=2002), so callers rotate through the list.
+        public static async Task<List<string>> GetServerIPsAsync(int deviceId)
+        {
             long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             int platform = 10001; // 20001 pano device
             string baseString = $"dev_id={deviceId}&platform={platform}&timestamp={timestamp}hsdata2022";
@@ -31,24 +40,25 @@ namespace V380Decoder.src
             string json = JsonSerializer.Serialize(request, _jsonOptions);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
+            var ips = new List<string>();
             using var client = new HttpClient();
             var response = await client.PostAsync(dispatchUrl, content);
             if (!response.IsSuccessStatusCode)
-                return string.Empty;
+                return ips;
 
             string responseBody = await response.Content.ReadAsStringAsync();
             DispatchResult result = JsonSerializer.Deserialize<DispatchResult>(responseBody, _jsonOptions);
             if (result.code != 2000)
-                return string.Empty;
+                return ips;
 
             foreach (var item in result.data)
             {
                 if (await IsServerReachableAsync(item.ip, 8800))
                 {
-                    return item.ip;
+                    ips.Add(item.ip);
                 }
             }
-            return string.Empty;
+            return ips;
         }
 
         private static string ComputeSha1Hash(string input)

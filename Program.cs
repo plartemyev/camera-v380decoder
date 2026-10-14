@@ -70,13 +70,16 @@ if (args.Length > 0)
     int streamQuality = quality.Equals("sd", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
 
     string relayIp = string.Empty;
+    List<string> clientRelayCandidates = new();
     if (sourceStream == SourceStream.Cloud)
     {
-        relayIp = await DispatchRelayServer.GetServerIPAsync(id);
-        if (string.IsNullOrEmpty(relayIp))
+        var relays = await DispatchRelayServer.GetServerIPsAsync(id);
+        if (relays.Count == 0)
         {
             Console.Error.WriteLine("[V380] failed to get relay server");
         }
+        clientRelayCandidates = relays;
+        relayIp = relays.FirstOrDefault(string.Empty);
         Console.Error.WriteLine($"[V380] using relay server {relayIp}");
     }
 
@@ -93,6 +96,8 @@ if (args.Length > 0)
         streamQuality
     );
     client.Channel = channel;
+    if (sourceStream == SourceStream.Cloud && clientRelayCandidates.Count > 0)
+        client.SetRelayCandidates(clientRelayCandidates);
 
     RtspServer rtsp = null;
     WebServer webServer = null;

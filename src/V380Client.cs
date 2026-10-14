@@ -20,7 +20,11 @@ namespace V380Decoder.src
         private uint serverEpoch;         // resp463[8]
         private volatile bool controlPingPending;
         private CancellationTokenSource? controlKaCts;
+        private readonly ManualResetEventSlim firstPongDone = new ManualResetEventSlim(false);
         private readonly string ip;
+        private List<string> relayCandidates = new();
+        private int relayIdx;
+        private string CurrentRelay => relayCandidates.Count == 0 ? ip : relayCandidates[Math.Abs(relayIdx) % relayCandidates.Count];
         private readonly int port;
         private readonly uint deviceId;
         private readonly string username, password;
@@ -35,6 +39,7 @@ namespace V380Decoder.src
         private StreamWriter? frameDump;
         private bool frameDumpEnabled = false;
         private bool needReconnect = false;
+        private int authFailures = 0;
 
         public V380Client(string ip, int port, uint deviceId, string username, string password, SourceStream source, OutputMode mode, int streamQuality)
         {
@@ -48,6 +53,12 @@ namespace V380Decoder.src
             this.streamQuality = streamQuality;
             if (mode == OutputMode.Rtsp)
                 snapshotManager = new SnapshotManager();
+        }
+
+        public void SetRelayCandidates(List<string> ips)
+        {
+            relayCandidates = ips ?? new List<string>();
+            Console.Error.WriteLine($"[V380] relay candidates: {string.Join(", ", relayCandidates)}");
         }
 
         public void Run(RtspServer rtsp, CancellationToken ct)
@@ -69,7 +80,17 @@ namespace V380Decoder.src
                 try
                 {
                     int auth = GetAuthTicket();
-                    if (auth == 0) continue;
+                    if (auth == 0)
+                    {
+                        if (source == SourceStream.Cloud)
+                        {
+                            authFailures++;
+                            RotateRelay();
+                            if (authFailures % 4 == 0) RefreshRelayList();
+                            Thread.Sleep(2000);
+                        }
+                        continue;
+                    }
                     if (auth == -1) break;
 
                     if (source == SourceStream.Cloud && deviceVersion > 30)
@@ -117,7 +138,7 @@ namespace V380Decoder.src
             try
             {
                 authClient = new TcpClient();
-                var r = authClient.BeginConnect(ip, port, null, null);
+                var r = authClient.BeginConnect(CurrentRelay, port, null, null);
                 if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
                 {
                     Console.Error.WriteLine("[AUTH] failed connecting to socket. retrying...");
@@ -189,6 +210,15 @@ namespace V380Decoder.src
                 byte version = resp[12];
                 uint ticket = ReadUInt32LE(resp, 13);
                 uint session = ReadUInt32LE(resp, 17);
+                if (loginResult != 1001 || ticket == 0)
+                {
+                    // 1002 + resultValue=-9 + ticket=0 = credentials/session rejected -
+                    // this relay can't currently reach the camera. Rotate to the next
+                    // dispatch relay instead of thrashing this one.
+                    Console.Error.WriteLine($"[AUTH] rejected (result={loginResult} resultValue={(int)resultValue} ticket={ticket}) - rotating relay");
+                    authStream.Close(); authClient.Close();
+                    return 0;
+                }
                 byte deviceType = resp[21];
                 byte camType = resp[22];
                 uint vendorId = ReadUInt16LE(resp, 23);
@@ -254,31 +284,47 @@ namespace V380Decoder.src
             WriteUInt32LE(cmd, 70, sessionId != 0 ? sessionId : authTicket);
             if (withDateTime)
             {
+                // App stamps cmd363 with "now": [70]=unix epoch (server echoes it
+                // at resp463[8]) and [74..80]=local date/time; a stale value here
+                // gets resp463 result=2002
                 var now = DateTime.Now;
+                var epoch = (uint)((DateTimeOffset)now.ToUniversalTime()).ToUnixTimeSeconds();
+                WriteUInt32LE(cmd, 70, epoch);
                 WriteUInt16LE(cmd, 74, (ushort)now.Year);
                 cmd[76] = (byte)now.Month;
                 cmd[77] = (byte)now.Day;
                 cmd[78] = (byte)now.Hour;
                 cmd[79] = (byte)now.Minute;
                 cmd[80] = (byte)now.Second;
+                cmd[81] = 1; // observed =1 on cmd363 (stream select?)
             }
         }
 
         void RunModernCloudSession(RtspServer rtsp, CancellationToken ct)
         {
-            Console.Error.WriteLine("[MODERN] starting v31 cloud session (control 361 + live 363)");
+            Console.Error.WriteLine($"[MODERN] v31 session on relay {CurrentRelay} (control 361 + live 363)");
             try
             {
                 if (!SessionConnect())
                 {
                     Console.Error.WriteLine("[MODERN] control connection failed");
+                    RotateRelay();
                     Thread.Sleep(3000);
                     return;
                 }
                 if (!LiveLogin())
                 {
-                    Console.Error.WriteLine("[MODERN] live login failed");
+                    Console.Error.WriteLine("[MODERN] live login failed - trying bulk 301 channel on same relay");
                     CloseModern();
+                    // Windows client proved SD video flows on the 301/401 bulk channel
+                    // (resp401 100/1/269 + 12-byte go + 512-B records)
+                    if (StreamLogin() && StartStream())
+                    {
+                        ReceiveBulkFrames(rtsp, ct);
+                        return;
+                    }
+                    RotateRelay();
+                    RefreshRelayList();
                     Thread.Sleep(3000);
                     return;
                 }
@@ -295,10 +341,28 @@ namespace V380Decoder.src
             }
         }
 
+        /// The dispatch list is geo load-balanced and the camera is attached to only
+        /// some relays (others answer "offline"=2002 or stall). Re-query periodically
+        /// - this is what the Windows client effectively does while hammering the list.
+        void RefreshRelayList()
+        {
+            try
+            {
+                var ips = DispatchRelayServer.GetServerIPsAsync((int)deviceId).GetAwaiter().GetResult();
+                if (ips.Count > 0)
+                {
+                    relayCandidates = ips;
+                    Console.Error.WriteLine($"[V380] refreshed relay candidates: {string.Join(", ", ips)}");
+                }
+            }
+            catch { }
+        }
+
         bool SessionConnect()
         {
+            firstPongDone.Reset();
             controlClient = new TcpClient { NoDelay = true, ReceiveBufferSize = 0x8000 };
-            var r = controlClient.BeginConnect(ip, port, null, null);
+            var r = controlClient.BeginConnect(CurrentRelay, port, null, null);
             if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
             {
                 Console.Error.WriteLine("[CTRL] connect timeout");
@@ -310,6 +374,18 @@ namespace V380Decoder.src
 
             var cmd361 = new byte[256];
             BuildCloudLogin(cmd361, 361, 1012, withDateTime: false);
+            // App registers validity: start = today, expiry = today 23:59:59
+            // (LE16 fields: y@72 m@74 d@76, y@90 m@92 d@94 h@96 min@98 s@100)
+            var now = DateTime.Now;
+            WriteUInt16LE(cmd361, 72, (ushort)now.Year);
+            WriteUInt16LE(cmd361, 74, (ushort)now.Month);
+            WriteUInt16LE(cmd361, 76, (ushort)now.Day);
+            WriteUInt16LE(cmd361, 90, (ushort)now.Year);
+            WriteUInt16LE(cmd361, 92, (ushort)now.Month);
+            WriteUInt16LE(cmd361, 94, (ushort)now.Day);
+            WriteUInt16LE(cmd361, 96, 23);
+            WriteUInt16LE(cmd361, 98, 59);
+            WriteUInt16LE(cmd361, 100, 59);
             if (!SendData(controlStream, cmd361)) return false;
 
             var resp = ReceiveExact(controlStream, 256, 10);
@@ -340,6 +416,7 @@ namespace V380Decoder.src
                             var cmd362 = new byte[16];
                             WriteUInt32LE(cmd362, 0, 362);
                             kaStream.Write(cmd362, 0, 16);
+                            firstPongDone.Set();
                         }
                         else
                         {
@@ -356,8 +433,15 @@ namespace V380Decoder.src
 
         bool LiveLogin()
         {
+            // App waits ~3s after the control connection before cmd363 - i.e. it
+            // completes at least one server-ping/cmd362-pong cycle first.
+            if (!firstPongDone.Wait(6000))
+                Console.Error.WriteLine("[LIVE] no server ping yet, trying anyway");
+            else
+                Console.Error.WriteLine("[LIVE] first pong cycle done, opening live channel");
+
             liveClient = new TcpClient { NoDelay = true, ReceiveBufferSize = 0x8000 };
-            var r = liveClient.BeginConnect(ip, port, null, null);
+            var r = liveClient.BeginConnect(CurrentRelay, port, null, null);
             if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
             {
                 Console.Error.WriteLine("[LIVE] connect timeout");
@@ -378,6 +462,20 @@ namespace V380Decoder.src
                 return false;
             }
             uint result = ReadUInt32LE(resp463, 4);
+            if (result != 1000)
+            {
+                Console.Error.WriteLine($"[LIVE] resp463 result={result} full={BitConverter.ToString(resp463)} (1000 expected), retrying...");
+                Thread.Sleep(3000);
+                liveStream.Write(cmd363, 0, cmd363.Length);
+                resp463 = ReceiveExact(liveStream, 64, 10);
+                if (resp463 == null || ReadUInt32LE(resp463, 0) != 463) return false;
+                result = ReadUInt32LE(resp463, 4);
+                if (result != 1000)
+                {
+                    Console.Error.WriteLine($"[LIVE] resp463 still result={result}, giving up");
+                    return false;
+                }
+            }
             serverEpoch = ReadUInt32LE(resp463, 8);
             recordSize = resp463.Length >= 0x50 ? ReadUInt32LE(resp463, 0x4c) : 2040;
             if (recordSize == 0 || recordSize > 65536) recordSize = 2040;
@@ -497,6 +595,100 @@ namespace V380Decoder.src
             }
         }
 
+        /// 301/401 bulk channel reader (the Windows client's SD stream):
+        /// fixed 512-byte records - 16-byte header `7f 00 01 XX 01 [seq] 00 f4
+        /// 01 02 00 00 [4B]` + 496-byte (encrypted) payload. Data starts right
+        /// after resp401(32) + go(12), which StreamLogin already consumed.
+        void ReceiveBulkFrames(RtspServer rtsp, CancellationToken ct)
+        {
+            var s = streamStream!;
+            var dumpPath = Environment.GetEnvironmentVariable("V380_LIVE_DUMP");
+            FileStream? dump = null;
+            if (!string.IsNullOrEmpty(dumpPath))
+            {
+                dump = new FileStream(dumpPath + ".bulk", FileMode.Create, FileAccess.Write, FileShare.Read);
+                Console.Error.WriteLine($"[BULK] dumping records to {dumpPath}.bulk");
+            }
+
+            var chain = new List<byte>();
+            ushort lastSeq = 0;
+            bool haveSeq = false;
+            long recCount = 0;
+            const int recordsPerFrame = 8;
+            var kaDeadline = DateTime.Now.AddSeconds(0.2);
+            var lastAck = DateTime.Now;
+
+            Console.Error.WriteLine("[RECV-BULK] record loop started");
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    // cmd5005 ACK every ~200 ms, like the app
+                    if (DateTime.Now > kaDeadline)
+                    {
+                        var ack = new byte[16];
+                        WriteUInt32LE(ack, 0, 5005);
+                        WriteUInt16LE(ack, 4, haveSeq ? (ushort)(lastSeq + 1) : (ushort)0);
+                        WriteUInt16LE(ack, 6, (ushort)Math.Min(65535, (int)(DateTime.Now - lastAck).TotalMilliseconds));
+                        try { s.Write(ack, 0, 16); } catch { }
+                        lastAck = DateTime.Now;
+                        kaDeadline = DateTime.Now.AddSeconds(0.2);
+                    }
+
+                    // sync + header
+                    if (!ReadByteOrTimeout(s, out byte b0)) { needReconnect = true; break; }
+                    while (b0 != 0x7f)
+                    {
+                        LogUtils.debug($"[RECV-BULK] sync skip {b0:X2}");
+                        if (!ReadByteOrTimeout(s, out b0)) { needReconnect = true; break; }
+                    }
+                    if (b0 != 0x7f) break;
+                    var hdr = new byte[16];
+                    hdr[0] = b0;
+                    if (ReadExact(s, hdr, 1, 15) < 15) { needReconnect = true; break; }
+                    ushort seq = hdr[5];
+                    var payload = new byte[496];
+                    if (ReadExact(s, payload, 0, 496) < 496) { needReconnect = true; break; }
+                    recCount++;
+                    dump?.Write(payload, 0, payload.Length);
+                    if (recCount <= 8 || recCount % 100 == 0)
+                        Console.Error.WriteLine($"[RECV-BULK] rec#{recCount} hdr={BitConverter.ToString(hdr, 0, 8)} seq={seq}");
+
+                    // frame boundary heuristic: seq reset to 0 starts a new frame
+                    if (haveSeq && seq <= lastSeq && chain.Count > 0)
+                    {
+                        DispatchBulkFrame(chain, rtsp);
+                        chain = new List<byte>();
+                    }
+                    chain.AddRange(payload);
+                    lastSeq = seq;
+                    haveSeq = true;
+                    if (chain.Count >= 496 * recordsPerFrame)
+                    {
+                        DispatchBulkFrame(chain, rtsp);
+                        chain = new List<byte>();
+                    }
+                }
+            }
+            finally
+            {
+                dump?.Dispose();
+                if (chain.Count >= 496)
+                    DispatchBulkFrame(chain, rtsp);
+                Console.Error.WriteLine($"[RECV-BULK] loop ended: recs={recCount}");
+            }
+        }
+
+        void DispatchBulkFrame(List<byte> chain, RtspServer rtsp)
+        {
+            var full = chain.ToArray();
+            LogUtils.debug($"[BULK-FRAME] len={full.Length} head={BitConverter.ToString(full, 0, Math.Min(24, full.Length))}");
+            if (!HandleAsMediaFrame(0x00, full, needDecrypt: deviceVersion > 30, mode, rtsp, null))
+            {
+                Console.Error.WriteLine($"[BULK-FRAME] unroutable len={full.Length} head={BitConverter.ToString(full, 0, Math.Min(16, full.Length))}");
+            }
+        }
+
         /// Reads a V380 record header (7f type seq flag len32), byte-syncing on 0x7f.
         /// Returns total header bytes consumed (always 8), 0 on stream end/timeout.
         int SyncAndReadHeader(NetworkStream s, out uint type, out ushort seq, out uint flag, out uint len)
@@ -561,6 +753,15 @@ namespace V380Decoder.src
             return buf;
         }
 
+        void RotateRelay()
+        {
+            if (relayCandidates.Count > 1)
+            {
+                relayIdx++;
+                Console.Error.WriteLine($"[V380] switching relay -> {CurrentRelay}");
+            }
+        }
+
         void CloseModern()
         {
             try
@@ -587,7 +788,7 @@ namespace V380Decoder.src
                 NoDelay = true,
                 ReceiveBufferSize = 0x8000
             };
-            var r = streamClient.BeginConnect(ip, port, null, null);
+            var r = streamClient.BeginConnect(CurrentRelay, port, null, null);
             if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
             {
                 Console.Error.WriteLine("[STREAM] failed connecting to socket. retrying...");
@@ -636,7 +837,7 @@ namespace V380Decoder.src
             // App reads resp401 as exactly 32 bytes (16 header + 16 zero pad),
             // then a 12-byte "go" message before frames start. The old 412-byte
             // read swallowed the stream start into the header buffer.
-            var resp401 = ReceiveExact(streamStream, 32, 10);
+            var resp401 = ReceiveExact(streamStream, 32, 6);
 
             if (resp401 == null || resp401.Length < 8)
             {
@@ -655,7 +856,7 @@ namespace V380Decoder.src
             int reasonCode = resp401.Length >= 16 ? (int)ReadUInt32LE(resp401, 12) : 0;
 
             // 12-byte stream-start message: 1f 00 05 d0 02 14 00 10 01 00 00 00
-            var go = ReceiveExact(streamStream, 12, 10);
+            var go = ReceiveExact(streamStream, 12, 6);
             Console.Error.WriteLine($"[STREAM] go message: {(go == null ? "none" : BitConverter.ToString(go))}");
 
             LogUtils.debug($"[STREAM] login raw hex: {BitConverter.ToString(resp401, 0, Math.Min(resp401.Length, 32))}");
